@@ -1,15 +1,11 @@
-use bson::{Bson, Document};
+//use bson::{Bson, Document};
 use cloudevents::{
     binding::rdkafka::MessageExt, event::ExtensionValue, AttributesReader, Data, Event,
 };
 use config::{Config, Environment};
 use futures_util::stream::StreamExt;
 use indexmap::IndexMap;
-use mongodb::{
-    bson::doc,
-    options::{ClientOptions, UpdateOptions},
-    Client, Database,
-};
+
 use rdkafka::{
     config::FromClientConfig,
     consumer::{CommitMode, Consumer, StreamConsumer},
@@ -19,10 +15,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+use lazy_static::lazy_static;
+use prometheus::{
+    IntCounter,
+    register_int_counter
+};
+
 #[derive(Clone, Debug, Deserialize)]
 struct ApplicationConfig {
     pub kafka: KafkaClient,
-    pub mongodb: MongoDbClient,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -31,12 +32,6 @@ struct KafkaClient {
     #[serde(default)]
     pub properties: HashMap<String, String>,
     pub topic: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct MongoDbClient {
-    pub url: String,
-    pub database: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,9 +47,20 @@ pub struct ThingState {
 }
 
 struct Processor {
-    consumer: StreamConsumer,
-    db: Database,
+    consumer: StreamConsumer
 }
+
+struct Metrics {
+    devices: Vec<String>,
+}
+
+lazy_static! {
+    static ref TOTAL_EVENTS: IntCounter =
+        register_int_counter!("total events", "the total number of events processed by drogue cloud").unwrap();
+    static ref DEVICES_SEEN: IntCounter =
+        register_int_counter!("devices", "the number of uniques devices that sent messages").unwrap();
+}
+
 
 impl Processor {
     pub async fn new(config: ApplicationConfig) -> anyhow::Result<Self> {
@@ -74,20 +80,10 @@ impl Processor {
         let consumer = StreamConsumer::<_, DefaultRuntime>::from_config(&kafka_config)?;
         consumer.subscribe(&[&config.kafka.topic])?;
 
-        // mongodb
-
-        let client = {
-            let options = ClientOptions::parse(&config.mongodb.url).await?;
-            log::info!("MongoDB Config: {:#?}", options);
-            Client::with_options(options)?
-        };
-
-        let db = client.database(&config.mongodb.database);
-
-        Ok(Self { consumer, db })
+        Ok(Self { consumer})
     }
 
-    pub async fn run(self) {
+    pub async fn run(self, metrics: &mut Metrics) {
         let mut stream = self.consumer.stream();
 
         log::info!("Running stream...");
@@ -102,7 +98,7 @@ impl Processor {
                     })
             }) {
                 None => break,
-                Some(Ok(msg)) => match self.handle(msg.1).await {
+                Some(Ok(msg)) => match self.handle(msg.1, metrics).await {
                     Ok(_) => {
                         if let Err(err) = self.consumer.commit_message(&msg.0, CommitMode::Async) {
                             log::info!("Failed to ack: {err}");
@@ -129,53 +125,51 @@ impl Processor {
         }
     }
 
-    async fn handle(&self, event: Event) -> Result<(), TwinEventError> {
-        self.process(TwinEvent::try_from(event)?).await?;
+    async fn handle(&self, event: Event, metrics: &mut Metrics) -> Result<(), TwinEventError> {
+        self.process(TwinEvent::try_from(event)?, metrics).await?;
 
         Ok(())
     }
 
-    async fn process(&self, event: TwinEvent) -> Result<(), TwinEventError> {
+    async fn process(&self, event: TwinEvent, metrics: &mut Metrics) -> Result<(), TwinEventError> {
+        TOTAL_EVENTS.inc();
         log::debug!("Processing twin event: {event:?}");
 
-        let collection = self.db.collection::<ThingState>(&event.application);
-
-        let mut update = Document::new();
-        for (k, v) in event.features {
-            let v: Bson = v.try_into()?;
-            update.insert(format!("features.{k}.properties"), v);
+        if ! metrics.devices.contains(&event.device) {
+            metrics.devices.push(event.device.clone());
+            DEVICES_SEEN.inc();
         }
 
-        if update.is_empty() {
-            return Ok(());
-        }
+        // let collection = self.db.collection::<ThingState>(&event.application);
+        //
+        // let mut update = Document::new();
+        // for (k, v) in event.features {
+        //     let v: Bson = v.try_into()?;
+        //     update.insert(format!("features.{k}.properties"), v);
+        // }
+        //
+        // if update.is_empty() {
+        //     return Ok(());
+        // }
+        //
+        // update.insert(
+        //     "lastUpdateTimestamp".to_string(),
+        //     Bson::String("$currentDate".to_string()),
+        // );
 
-        update.insert(
-            "lastUpdateTimestamp".to_string(),
-            Bson::String("$currentDate".to_string()),
-        );
 
-        let update = doc! {
-            "$setOnInsert": {
-                "creationTimestamp": "$currentDate"
-            },
-            "$inc": {
-                "revision": 1,
-            },
-            "$set": update,
-        };
 
-        log::debug!("Request update: {:#?}", update);
+        log::debug!("Event: {:#?}", event);
 
-        collection
-            .update_one(
-                doc! {
-                    "device": event.device
-                },
-                update,
-                Some(UpdateOptions::builder().upsert(true).build()),
-            )
-            .await?;
+        // collection
+        //     .update_one(
+        //         doc! {
+        //             "device": event.device
+        //         },
+        //         update,
+        //         Some(UpdateOptions::builder().upsert(true).build()),
+        //     )
+        //     .await?;
 
         Ok(())
     }
@@ -191,13 +185,15 @@ async fn main() -> anyhow::Result<()> {
         .build()?
         .try_deserialize()?;
 
+    let mut metrics = Metrics {devices: Vec::new() };
+
     log::info!("Configuration: {:#?}", config);
 
     let app = Processor::new(config).await?;
 
     // run
 
-    app.run().await;
+    app.run(&mut metrics).await;
 
     // done
 
